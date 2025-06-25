@@ -11,11 +11,11 @@ class GPTConfig:
 
 class TrainConfig:
     batch_size = 32
-    max_iters = 20000
+    max_iters = 80000
     learning_rate = 1e-4
     warmup_steps = 1000
     min_lr = 5e-4
-    eval_iters = 500
+    eval_iters = 1000
     gradient_accumulation_steps = 32
     dtype = 'bfloat16'
     best_model_params_path = "best_model_params.pt"
