@@ -124,42 +124,78 @@ This project is inspired by:
 
 
 
-## 🤗 Uploading to Hugging Face Hub
+## 🤗 Uploading to Hugging Face Hub for `transformers` Compatibility
 
-This project includes a script to upload your trained model to the Hugging Face Hub.
+This project includes an updated script (`src/upload_to_hub.py`) to upload your trained model to the Hugging Face Hub in a way that is compatible with the `transformers` library, allowing usage with `AutoModelForCausalLM.from_pretrained` and `AutoTokenizer.from_pretrained`.
 
 ### Prerequisites
-1. **Install `huggingface_hub`**:
-   ```bash
-   pip install huggingface_hub
-   ```
-   (This is also added to `requirements.txt`).
-2. **Login to Hugging Face CLI**:
-   You need to authenticate with the Hugging Face Hub. If you haven't already, run:
-   ```bash
-   huggingface-cli login
-   ```
-   And enter your Hugging Face API token.
 
-### 🚀 Upload Script
+1.  **Install Dependencies**:
+    Ensure all necessary libraries, including `transformers`, `tokenizers`, and `huggingface_hub`, are installed. The `requirements.txt` file has been updated:
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-Once you have trained your model (and `final_model.pt` or `best_model_params.pt` exists), you can run the upload script:
+2.  **Login to Hugging Face CLI**:
+    You need to be authenticated with the Hugging Face Hub. If you haven't done so already, run the following command and enter your Hugging Face API token (with write permissions):
+    ```bash
+    huggingface-cli login
+    ```
+
+### 🚀 Upload Script (`src/upload_to_hub.py`)
+
+Once your model has been trained (i.e., `final_model.pt` or `best_model_params.pt` exists), you can use the enhanced upload script:
 
 ```bash
 python -m src.upload_to_hub
 ```
 
-The script will:
-- Ask for your Hugging Face username and the desired model repository name if they are not set as environment variables (`HF_USERNAME`, `HF_MODEL_NAME`).
-- Load the model weights from `final_model.pt` (or `best_model_params.pt` if the former isn't found).
-- Upload the model weights as `pytorch_model.bin`.
-- Upload the model definition (`src/model.py`) as `model.py`.
-- Upload the model configuration (`config/config.py`) as `config.py`.
-- Create and upload a basic model card (`README.md`) to the Hub repository.
+This script will perform the following steps:
 
-After completion, your model will be available at `https://huggingface.co/YOUR_USERNAME/YOUR_MODEL_NAME`.
+1.  **Prompt for Credentials**: Ask for your Hugging Face username and the desired model repository name on the Hub, if these are not already set as environment variables (`HF_USERNAME`, `HF_MODEL_NAME`).
+2.  **Load Model and Config**:
+    *   Instantiate the modified `GPTConfig` (from `config.config.py`), which is `transformers.PretrainedConfig` compatible.
+    *   Instantiate the modified `GPT` model (from `src/model.py`), which now inherits from `transformers.PreTrainedModel`.
+3.  **Load Weights**: Load the weights from your saved `final_model.pt` (or `best_model_params.pt`) into the `transformers`-compatible `GPT` model. The script includes basic state dictionary key mapping, which might need refinement if layer names significantly diverged.
+4.  **Prepare Temporary Directory**: Create a temporary local directory (e.g., `hf_upload_temp`) to stage files for uploading.
+5.  **Save Model**: Use `model.save_pretrained(temp_dir)` to save the model weights as `pytorch_model.bin` and the model configuration as `config.json` in the temporary directory.
+6.  **Save Tokenizer**:
+    *   Initialize a `GPT2TokenizerFast.from_pretrained("gpt2")` (as the original model uses `tiktoken` with `gpt2` settings).
+    *   Use `tokenizer.save_pretrained(temp_dir)` to save the tokenizer files (`tokenizer.json`, `vocab.json`, `merges.txt`, etc.) in the temporary directory.
+7.  **Generate Model Card**: Create a detailed `README.md` (model card) specifically for the Hugging Face Hub. This card will include:
+    *   Model description, architecture details.
+    *   Instructions on how to load the model using `AutoModelForCausalLM.from_pretrained(YOUR_REPO_ID, trust_remote_code=True)` and `AutoTokenizer.from_pretrained(YOUR_REPO_ID)`.
+    *   The `trust_remote_code=True` flag is necessary because this model uses custom Python code defined in `src/model.py`.
+8.  **Upload to Hub**:
+    *   Upload the entire contents of the temporary directory (which now includes `pytorch_model.bin`, `config.json`, tokenizer files, and the Hub `README.md`) to the specified Hugging Face model repository.
+    *   Crucially, it will also upload the `src/model.py` file to the root of your Hugging Face model repository. This makes the custom model class available to the `transformers` library when `trust_remote_code=True` is used.
+9.  **Cleanup**: Remove the temporary local directory.
 
-**Note:** The uploaded model is a raw PyTorch state dictionary. The `model.py` and `config.py` files are provided in the Hub repository to help with loading, but it's not directly compatible with `transformers.AutoModel.from_pretrained` without further adaptation. The tokenizer used is `tiktoken` with `gpt2` settings.
+After these steps, your model will be accessible on the Hugging Face Hub (e.g., `https://huggingface.co/YOUR_USERNAME/YOUR_MODEL_NAME`) and can be loaded by anyone using the `transformers` library, provided they use `trust_remote_code=True`.
+
+### Example Usage from Hugging Face Hub
+
+Once uploaded, the model can be loaded and used like this:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Replace with your actual Hugging Face repository ID
+repo_id = "YOUR_USERNAME/YOUR_MODEL_NAME"
+
+# Load the tokenizer
+tokenizer = AutoTokenizer.from_pretrained(repo_id)
+
+# Load the model
+# trust_remote_code=True is essential as this model uses custom code (model.py)
+model = AutoModelForCausalLM.from_pretrained(repo_id, trust_remote_code=True)
+
+# Now you can use the model for generation
+prompt = "Once upon a time"
+inputs = tokenizer(prompt, return_tensors="pt")
+outputs = model.generate(**inputs, max_length=50)
+print(tokenizer.decode(outputs[0]))
+```
 
 ---
 

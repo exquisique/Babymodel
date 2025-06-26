@@ -1,11 +1,15 @@
+# src/upload_to_hub.py
 import os
 import torch
-import tiktoken
-from huggingface_hub import HfApi, ModelCard, ModelCardData
-from huggingface_hub.utils import HfFolder
+import shutil # For directory operations
+from huggingface_hub import HfApi, ModelCard, HfFolder
+from transformers import GPT2TokenizerFast # For saving a HF compatible tokenizer
 
-from src.model import GPT, GPTConfig
-from config.config import TrainConfig # Assuming this has best_model_params_path
+# Import the *modified* GPTConfig and GPT model
+from config.config import GPTConfig, TrainConfig
+from src.model import GPT # This is now the PreTrainedModel version
+
+TEMP_UPLOAD_DIR = "hf_upload_temp"
 
 def main():
     # Get Hugging Face credentials and model name
@@ -18,50 +22,97 @@ def main():
         hf_model_name = input("Enter the desired model name on Hugging Face Hub: ")
 
     repo_id = f"{hf_username}/{hf_model_name}"
-
     print(f"Preparing to upload model to: {repo_id}")
 
-    # --- 1. Load Model ---
-    print("Loading model...")
+    # Create a temporary directory for storing files to be uploaded
+    if os.path.exists(TEMP_UPLOAD_DIR):
+        shutil.rmtree(TEMP_UPLOAD_DIR)
+    os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+
+    # --- 1. Load Configuration & Instantiate Model ---
+    print("Loading configuration and instantiating model...")
+    # Use the modified GPTConfig that inherits from PretrainedConfig
     gpt_config = GPTConfig()
+    # Instantiate the modified GPT model (which is a PreTrainedModel)
     model = GPT(gpt_config)
 
-    # Load the trained weights
-    # Assuming the final model is saved as 'final_model.pt' in the root directory as per train.py
+    # --- 2. Load Trained Weights ---
+    # Load the original state_dict from final_model.pt or best_model_params.pt
     model_weights_path = "final_model.pt"
-    if not os.path.exists(model_weights_path):
-        print(f"Error: Model weights not found at {model_weights_path}")
-        print("Please ensure you have trained the model and 'final_model.pt' exists.")
-        # Attempt to load from best_model_params.pt if final_model.pt is not found
-        train_config = TrainConfig()
-        best_model_path = train_config.best_model_params_path
-        if os.path.exists(best_model_path):
-            print(f"Attempting to load weights from checkpoint: {best_model_path}")
-            checkpoint = torch.load(best_model_path, map_location='cpu') # Load to CPU
-            model.load_state_dict(checkpoint['model_state_dict'])
-            # Save it as final_model.pt for consistency in hub upload
-            torch.save(model.state_dict(), model_weights_path)
-            print(f"Loaded and saved weights from {best_model_path} to {model_weights_path}")
-        else:
-            print(f"Error: Neither {model_weights_path} nor {best_model_path} found.")
-            return
+    train_config_obj = TrainConfig() # To get best_model_params_path
+    best_model_path = train_config_obj.best_model_params_path
 
+    loaded_state_dict = None
+    if os.path.exists(model_weights_path):
+        print(f"Loading weights from {model_weights_path}...")
+        loaded_state_dict = torch.load(model_weights_path, map_location='cpu')
+    elif os.path.exists(best_model_path):
+        print(f"Attempting to load weights from checkpoint: {best_model_path}")
+        checkpoint = torch.load(best_model_path, map_location='cpu')
+        loaded_state_dict = checkpoint['model_state_dict']
+        # Optionally save these as final_model.pt for future non-HF use
+        # torch.save(loaded_state_dict, model_weights_path)
+        # print(f"Loaded and saved weights from {best_model_path} to {model_weights_path}")
     else:
-        model.load_state_dict(torch.load(model_weights_path, map_location='cpu'))
+        print(f"Error: Neither {model_weights_path} nor {best_model_path} found. Cannot proceed.")
+        shutil.rmtree(TEMP_UPLOAD_DIR)
+        return
 
-    model.eval() # Set to evaluation mode
-    print("Model loaded successfully.")
+    # --- State Dict Key Mapping (Important for custom models) ---
+    # The keys in your saved state_dict might not perfectly match the names
+    # in the Hugging Face PreTrainedModel structure. You may need to map them.
+    # Example: if original was 'transformer.layer.0...' and HF is 'transformer.h.0...'
+    # This is a placeholder, adjust based on your actual model structure vs. HF expectations.
+    # For this specific model, names were kept fairly consistent.
+    new_state_dict = {}
+    for k, v in loaded_state_dict.items():
+        new_key = k
+        # Example mapping (if needed):
+        # if k.startswith("transformer.layers"):
+        #    new_key = k.replace("transformer.layers", "transformer.h")
+        # elif k == "output_head.weight":
+        #    new_key = "lm_head.weight"
+        new_state_dict[new_key] = v
 
-    # --- 2. Prepare Tokenizer ---
-    # The project uses tiktoken with "gpt2" encoding.
-    # For Hugging Face, we typically save the tokenizer's configuration.
-    # Since tiktoken is a direct wrapper, we can note its usage.
-    # For full HF compatibility, one might convert to a `transformers` tokenizer,
-    # but for now, we'll upload the model and specify tokenizer type.
-    print("Tokenizer: tiktoken (gpt2)")
+    # If lm_head was tied to wte, ensure lm_head.weight is present if wte.weight is
+    if 'transformer.wte.weight' in new_state_dict and 'lm_head.weight' not in new_state_dict:
+        print("INFO: lm_head.weight not found in state_dict, attempting to use transformer.wte.weight (tie_weights).")
+        new_state_dict['lm_head.weight'] = new_state_dict['transformer.wte.weight']
 
-    # --- 3. Create Model Card ---
+    try:
+        model.load_state_dict(new_state_dict, strict=False) # Use strict=False initially for debugging mismatches
+        print("Model weights loaded into Hugging Face compatible model structure.")
+    except RuntimeError as e:
+        print(f"Error loading state_dict: {e}")
+        print("This might be due to mismatched keys between your saved model and the HF model structure.")
+        print("Please check the state_dict_key_mapping section in the script.")
+        shutil.rmtree(TEMP_UPLOAD_DIR)
+        return
+
+    model.eval()
+    print("Model loaded and set to evaluation mode.")
+
+    # --- 3. Save Model & Configuration using save_pretrained ---
+    print(f"Saving model and configuration to {TEMP_UPLOAD_DIR}...")
+    model.save_pretrained(TEMP_UPLOAD_DIR) # Saves pytorch_model.bin and config.json
+    print("Model and config.json saved.")
+
+    # --- 4. Prepare and Save Tokenizer ---
+    # The original project uses tiktoken with "gpt2".
+    # We'll save a GPT2TokenizerFast for compatibility.
+    print("Preparing and saving tokenizer...")
+    try:
+        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+        tokenizer.save_pretrained(TEMP_UPLOAD_DIR)
+        print(f"GPT2TokenizerFast (based on 'gpt2') saved to {TEMP_UPLOAD_DIR}.")
+    except Exception as e:
+        print(f"Could not save tokenizer: {e}")
+        shutil.rmtree(TEMP_UPLOAD_DIR)
+        return
+
+    # --- 5. Create Model Card ---
     print("Creating model card...")
+    # Use GPTConfig attributes that are now HF compatible
     model_card_content = f"""
 ---
 license: mit
@@ -70,130 +121,133 @@ tags:
 - gpt
 - tinystories
 - babymodel
+- causal-lm
+language: en
+pipeline_tag: text-generation
+# Important for models with custom code
+auto_model_class: AutoModelForCausalLM
 ---
 
 # {hf_model_name}
 
-This is a GPT-style language model based on the Babymodel architecture, trained on the TinyStories dataset.
+This is a GPT-style language model (`babymodel` architecture) trained on the TinyStories dataset.
+This repository contains the model weights, configuration, and tokenizer files compatible with the Hugging Face `transformers` library.
 
 ## Model Description
 
-- **Architecture:** GPT-like transformer ({gpt_config.n_layer} layers, {gpt_config.n_head} heads, {gpt_config.n_embd} embedding dimensions)
-- **Vocabulary Size:** {gpt_config.vocab_size}
-- **Context Length:** {gpt_config.block_size}
-- **Tokenizer:** `tiktoken` with `gpt2` encoding.
+- **Model Type:** `{gpt_config.model_type}`
+- **Architecture:** GPT-like transformer
+  - Layers: `{gpt_config.num_hidden_layers}`
+  - Heads: `{gpt_config.num_attention_heads}`
+  - Embedding Dimension: `{gpt_config.hidden_size}`
+- **Vocabulary Size:** `{gpt_config.vocab_size}`
+- **Context Length:** `{gpt_config.max_position_embeddings}`
+- **Tokenizer:** `GPT2TokenizerFast` (standard `gpt2` vocabulary and merges).
 
 ## Training Data
 
 The model was trained on the [TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories).
 
-## How to Use (Conceptual)
+## How to Use with Hugging Face `transformers`
+
+**Important:** This model uses custom code. You will need to pass `trust_remote_code=True` when loading the model. The necessary `model.py` file is included in this repository.
 
 ```python
-import torch
-import tiktoken
-# from your_model_loading_script import GPT, GPTConfig # Ensure these are accessible
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Load config and model (example)
-# config = GPTConfig()
-# model = GPT(config)
-# model.load_state_dict(torch.load("pytorch_model.bin", map_location="cpu")) # Assuming 'pytorch_model.bin' is the HF name
-# model.eval()
+repo_id = "{repo_id}" # Example: "your_username/your_model_name"
 
-# enc = tiktoken.get_encoding("gpt2")
-# prompt = "Once upon a time"
-# tokens = enc.encode(prompt)
-# input_ids = torch.tensor(tokens, dtype=torch.long).unsqueeze(0)
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(repo_id)
 
-# with torch.no_grad():
-#    output_ids = model.generate(input_ids, max_new_tokens=50) # Using the model's generate method
+# Load model
+# trust_remote_code=True is required because we use the custom model.py
+model = AutoModelForCausalLM.from_pretrained(repo_id, trust_remote_code=True)
 
-# generated_text = enc.decode(output_ids[0].tolist())
-# print(generated_text)
+# Example prompt
+prompt = "Once upon a time, in a land far away,"
+inputs = tokenizer(prompt, return_tensors="pt")
+
+# Generate text
+# You can use various generation parameters, e.g., max_length, num_beams, do_sample, top_k, top_p
+outputs = model.generate(**inputs, max_length=100, no_repeat_ngram_size=2)
+generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+print(generated_text)
 ```
 
-**Note:** This model is uploaded as a `.pt` file containing the state dictionary. You'll need the model class definition (`GPT` from `src/model.py`) and `GPTConfig` from `config/config.py` to load it. The tokenizer is `tiktoken` using `gpt2` pre-trained tokenizer.
+## Model Files
 
-For direct use with Hugging Face `transformers` library, further conversion might be needed.
+- `pytorch_model.bin`: The model weights.
+- `config.json`: Model configuration file.
+- `tokenizer.json`, `vocab.json`, `merges.txt`: Tokenizer files.
+- `model.py`: The custom model definition (required for `trust_remote_code=True`).
+
 """
-    card = ModelCard(model_card_content)
+    model_card = ModelCard(model_card_content)
+    model_card.save(os.path.join(TEMP_UPLOAD_DIR, 'README.md')) # Save as README.md in the temp dir
+    print("Model card created and saved to temp directory.")
 
-    # --- 4. Upload to Hugging Face Hub ---
+    # --- 6. Upload to Hugging Face Hub ---
     api = HfApi()
 
-    # Check login status
     token = HfFolder.get_token()
     if not token:
         print("You need to login to Hugging Face Hub first. Run 'huggingface-cli login'")
+        shutil.rmtree(TEMP_UPLOAD_DIR)
         return
 
-    print(f"Creating repository {repo_id} on Hugging Face Hub...")
+    print(f"Creating or updating repository {repo_id} on Hugging Face Hub...")
     try:
         api.create_repo(repo_id=repo_id, exist_ok=True, repo_type="model")
-        print(f"Repository {repo_id} created or already exists.")
+        print(f"Repository {repo_id} ensured.")
     except Exception as e:
-        print(f"Error creating repository: {e}")
+        print(f"Error creating/accessing repository: {e}")
+        shutil.rmtree(TEMP_UPLOAD_DIR)
         return
 
-    print(f"Uploading model weights ({model_weights_path}) to {repo_id}...")
+    print(f"Uploading contents of {TEMP_UPLOAD_DIR} to {repo_id}...")
     try:
-        api.upload_file(
-            path_or_fileobj=model_weights_path,
-            path_in_repo="pytorch_model.bin", # Standard name for PyTorch models on Hub
+        # Upload the entire folder (model weights, config, tokenizer files, model card)
+        api.upload_folder(
+            folder_path=TEMP_UPLOAD_DIR,
             repo_id=repo_id,
             repo_type="model",
+            commit_message=f"Upload {hf_model_name} model files",
         )
-        print("Model weights uploaded successfully.")
-    except Exception as e:
-        print(f"Error uploading model weights: {e}")
-        return
+        print("Folder uploaded successfully.")
 
-    print(f"Uploading model card (README.md) to {repo_id}...")
-    try:
-        # Create a temporary file for the model card if upload_file needs a path
-        with open("temp_README.md", "w", encoding="utf-8") as f:
-            f.write(str(card))
-
-        api.upload_file(
-            path_or_fileobj="temp_README.md",
-            path_in_repo="README.md",
-            repo_id=repo_id,
-            repo_type="model",
-        )
-        os.remove("temp_README.md") # Clean up temporary file
-        print("Model card uploaded successfully.")
-    except Exception as e:
-        print(f"Error uploading model card: {e}")
-        if os.path.exists("temp_README.md"):
-            os.remove("temp_README.md")
-        return
-
-    # Upload config files for reproducibility
-    config_files_to_upload = {
-        "config/config.py": "config.py", # Store it as config.py in the repo
-        "src/model.py": "model.py"      # Store the model definition
-    }
-
-    for local_path, repo_path in config_files_to_upload.items():
-        if os.path.exists(local_path):
-            print(f"Uploading {local_path} to {repo_path} in {repo_id}...")
-            try:
-                api.upload_file(
-                    path_or_fileobj=local_path,
-                    path_in_repo=repo_path,
-                    repo_id=repo_id,
-                    repo_type="model",
-                )
-                print(f"{local_path} uploaded successfully.")
-            except Exception as e:
-                print(f"Error uploading {local_path}: {e}")
+        # Additionally, upload the model.py script to the root of the repo
+        # This is crucial for trust_remote_code=True
+        model_script_path = "src/model.py"
+        if os.path.exists(model_script_path):
+            print(f"Uploading {model_script_path} to the root of {repo_id} for trust_remote_code=True...")
+            api.upload_file(
+                path_or_fileobj=model_script_path,
+                path_in_repo="model.py", # Save as model.py in the repo root
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message="Add custom model.py for trust_remote_code"
+            )
+            print(f"{model_script_path} uploaded successfully.")
         else:
-            print(f"Warning: Config file {local_path} not found. Skipping.")
+            print(f"WARNING: {model_script_path} not found. trust_remote_code=True might not work without it in the repo.")
 
+    except Exception as e:
+        print(f"Error uploading files: {e}")
+        shutil.rmtree(TEMP_UPLOAD_DIR)
+        return
+
+    # --- 7. Cleanup ---
+    try:
+        shutil.rmtree(TEMP_UPLOAD_DIR)
+        print(f"Cleaned up temporary directory: {TEMP_UPLOAD_DIR}")
+    except Exception as e:
+        print(f"Error cleaning up temporary directory: {e}")
 
     print("\n--- Upload Complete! ---")
-    print(f"Model available at: https://huggingface.co/{repo_id}")
-    print("Please ensure you have the necessary files (`model.py`, `config.py`) and `tiktoken` to use this model.")
+    print(f"Model should be available at: https://huggingface.co/{repo_id}")
+    print(f"Remember to use `trust_remote_code=True` when loading with AutoModelForCausalLM.")
 
 if __name__ == "__main__":
     main()
