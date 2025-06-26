@@ -124,6 +124,45 @@ This project is inspired by:
 
 
 
+## 🤗 Uploading to Hugging Face Hub
+
+This project includes a script to upload your trained model to the Hugging Face Hub.
+
+### Prerequisites
+1. **Install `huggingface_hub`**:
+   ```bash
+   pip install huggingface_hub
+   ```
+   (This is also added to `requirements.txt`).
+2. **Login to Hugging Face CLI**:
+   You need to authenticate with the Hugging Face Hub. If you haven't already, run:
+   ```bash
+   huggingface-cli login
+   ```
+   And enter your Hugging Face API token.
+
+### 🚀 Upload Script
+
+Once you have trained your model (and `final_model.pt` or `best_model_params.pt` exists), you can run the upload script:
+
+```bash
+python -m src.upload_to_hub
+```
+
+The script will:
+- Ask for your Hugging Face username and the desired model repository name if they are not set as environment variables (`HF_USERNAME`, `HF_MODEL_NAME`).
+- Load the model weights from `final_model.pt` (or `best_model_params.pt` if the former isn't found).
+- Upload the model weights as `pytorch_model.bin`.
+- Upload the model definition (`src/model.py`) as `model.py`.
+- Upload the model configuration (`config/config.py`) as `config.py`.
+- Create and upload a basic model card (`README.md`) to the Hub repository.
+
+After completion, your model will be available at `https://huggingface.co/YOUR_USERNAME/YOUR_MODEL_NAME`.
+
+**Note:** The uploaded model is a raw PyTorch state dictionary. The `model.py` and `config.py` files are provided in the Hub repository to help with loading, but it's not directly compatible with `transformers.AutoModel.from_pretrained` without further adaptation. The tokenizer used is `tiktoken` with `gpt2` settings.
+
+---
+
 ## 🧑‍💻 Author
 **Exquisique** — GenAI explorer, language enthusiast, and poetic dreamer.
 
